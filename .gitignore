@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Data and artifacts (keep datasets out of the repo)
+data/
+artifacts/
+baselines/
+
+# VS Code
+.vscode/
+
+# OS
+Thumbs.db
+desktop.ini
