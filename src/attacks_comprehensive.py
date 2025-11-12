@@ -752,14 +752,49 @@ def create_label_flip_config(flip_percent: float = 0.4) -> dict[str, Any]:
         "description": f"Label flip attack with {flip_percent*100}% flip rate"
     }
 
-def create_backdoor_config(trigger_features: dict[str, Any], injected_samples: int = 15) -> dict[str, Any]:
-    """Creates configuration for Backdoor attack."""
-    return {
+def create_backdoor_config(
+    trigger_features: dict[str, Any] | None = None,
+    injected_samples: int = 15,
+    backdoor_trigger: str | None = None,
+    backdoor_target: int | None = None,
+    poison_ratio: float | None = None,
+    trigger_strength: float | None = None,
+    attack_rounds: Any | None = None,
+    poison_in_server_share: float | None = None,
+    eval_probe_size: int | None = None,
+    asr_threshold_for_alert: float | None = None,
+    n_rounds: int | None = None,
+) -> dict[str, Any]:
+    """Creates configuration for Backdoor attack with optional workflow keys.
+
+    Backward compatible: existing callers can pass just trigger_features and injected_samples.
+    """
+    cfg = {
         "attack_type": "backdoor",
         "trigger_features": trigger_features,
         "injected_samples": injected_samples,
         "description": f"Backdoor attack with {injected_samples} poisoned samples"
     }
+    # Optional workflow parameters (only include if provided)
+    if backdoor_trigger is not None:
+        cfg["backdoor_trigger"] = backdoor_trigger
+    if backdoor_target is not None:
+        cfg["target_label"] = int(backdoor_target)
+    if poison_ratio is not None:
+        cfg["poison_ratio"] = float(poison_ratio)
+    if trigger_strength is not None:
+        cfg["trigger_strength"] = float(trigger_strength)
+    if attack_rounds is not None:
+        cfg["attack_rounds"] = attack_rounds
+    if poison_in_server_share is not None:
+        cfg["poison_in_server_share"] = float(poison_in_server_share)
+    if eval_probe_size is not None:
+        cfg["eval_probe_size"] = int(eval_probe_size)
+    if asr_threshold_for_alert is not None:
+        cfg["asr_threshold_for_alert"] = float(asr_threshold_for_alert)
+    if n_rounds is not None:
+        cfg["num_rounds"] = int(n_rounds)
+    return cfg
 
 # =============================================================================
 # MAIN ATTACK FACTORY
@@ -853,6 +888,59 @@ def compute_attack_success_rate(y_true: np.ndarray, y_pred: np.ndarray,
     
     asr = (misclassified / total_fraud) * 100.0
     return float(asr)
+
+# -----------------------------------------------------------------------------
+# Backdoor probe helpers
+# -----------------------------------------------------------------------------
+
+def prepare_backdoor_trigger_features(trigger_type: str,
+                                      strength: float,
+                                      feature_columns: list[str]) -> dict[str, Any]:
+    """Prepare a trigger_features mapping based on a trigger type and strength.
+
+    trigger_type: one of {'pixel_pattern','feature_mask','feature_shift'} or any string.
+    strength in [0,1] controls magnitude of shifts.
+    """
+    import random
+    rng = random.Random()
+    strength = float(max(0.0, min(1.0, strength)))
+    n = len(feature_columns)
+    if n == 0:
+        return {}
+    # choose 2-4 features
+    k = max(2, min(4, n))
+    chosen = rng.sample(list(feature_columns), k)
+    trig = {}
+    for f in chosen:
+        fname = str(f).lower()
+        if trigger_type == 'feature_mask':
+            # set to 0 or 1 deterministically by name hash
+            trig[f] = float((hash(fname) % 2))
+        elif trigger_type == 'feature_shift':
+            # shift to a mid/high value scaled by strength
+            base = 0.5 + 0.5 * strength
+            trig[f] = round(base, 3)
+        else:  # 'pixel_pattern' or default: set distinct pattern per column
+            base = ((abs(hash(fname)) % 100) / 100.0)
+            # pull towards edge depending on strength
+            edge = 1.0 if (hash(fname) % 2 == 0) else 0.0
+            trig[f] = round(base * (1 - strength) + edge * strength, 3)
+    return trig
+
+def generate_triggered_probe(X: np.ndarray,
+                             y: np.ndarray,
+                             trigger_features: dict[str, Any],
+                             feature_columns: list[str] | None = None,
+                             size: int = 500) -> tuple[np.ndarray, np.ndarray]:
+    """Generate a small triggered probe from given arrays by sampling and applying trigger."""
+    if X is None or y is None or len(X) == 0:
+        return np.empty((0, 0)), np.array([])
+    size = int(max(1, min(size, len(X))))
+    idx = np.random.choice(len(X), size=size, replace=False)
+    Xs = X[idx]
+    ys = y[idx]
+    X_trig = apply_trigger_to_data(Xs, trigger_features, feature_columns)
+    return (X_trig.values if hasattr(X_trig, 'values') else X_trig), ys
 
 # =============================================================================
 # ATTACK METADATA

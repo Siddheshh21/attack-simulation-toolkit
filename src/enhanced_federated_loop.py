@@ -16,8 +16,11 @@ from .attacks_comprehensive import (
     spawn_sybil_clients,
     label_flip,
     byzantine_update,
-    compute_attack_success_rate
+    compute_attack_success_rate,
+    apply_trigger_to_data,
+    prepare_backdoor_trigger_features
 )
+from .detection import run_detection_pipeline
 
 # -----------------------------
 # Helper functions
@@ -929,6 +932,65 @@ class AttackedFLClient(_BaseFLClient):
                 np.random.seed(seed_val)
             except Exception:
                 pass
+            try:
+                if getattr(self, 'is_attacker', False) and self.attack_type == 'backdoor':
+                    rounds_cfg = self.attack_config.get('attack_rounds')
+                    active = True
+                    try:
+                        if isinstance(rounds_cfg, (list, tuple)):
+                            if len(rounds_cfg) == 2 and all(isinstance(v, (int, float)) for v in rounds_cfg):
+                                lo, hi = int(rounds_cfg[0]), int(rounds_cfg[1])
+                                active = (int(round_num) >= lo and int(round_num) <= hi)
+                            else:
+                                active = int(round_num) in set(int(x) for x in rounds_cfg)
+                    except Exception:
+                        active = True
+                    if active and len(self.X_train) > 0:
+                        Xdf = self.X_train.copy()
+                        ysr = self.y_train.copy()
+                        try:
+                            trig = (self.attack_config.get('trigger_features') or prepare_backdoor_trigger_features(
+                                str(self.attack_config.get('backdoor_trigger', 'feature_shift')),
+                                float(self.attack_config.get('trigger_strength', 0.3) or 0.3),
+                                list(Xdf.columns)))
+                            self.attack_config['trigger_features'] = trig
+                        except Exception:
+                            trig = {}
+                        try:
+                            pr = float(self.attack_config.get('poison_ratio', self.attack_config.get('poison_fraction', 0.05)) or 0.05)
+                        except Exception:
+                            pr = 0.05
+                        pr = float(max(0.0, min(1.0, pr)))
+                        try:
+                            tlabel = int(self.attack_config.get('target_label', self.attack_config.get('backdoor_target', 0)) or 0)
+                        except Exception:
+                            tlabel = 0
+                        n = len(ysr)
+                        k = int(n * pr)
+                        if k > 0 and trig:
+                            idx = np.random.choice(n, size=k, replace=False)
+                            try:
+                                for col, val in trig.items():
+                                    if col in Xdf.columns:
+                                        Xdf.loc[Xdf.index[idx], col] = float(val)
+                            except Exception:
+                                pass
+                            try:
+                                ysr.iloc[idx] = float(tlabel)
+                            except Exception:
+                                pass
+                            self.X_train = Xdf
+                            self.y_train = ysr
+                        try:
+                            self.trigger_rate = compute_trigger_rate(self.X_train, self.attack_config.get('trigger_features') or {})
+                        except Exception:
+                            self.trigger_rate = 0.0
+                        try:
+                            self._train_pos_ratio_poison = float(self.y_train.mean())
+                        except Exception:
+                            self._train_pos_ratio_poison = self._train_pos_ratio_orig
+            except Exception:
+                pass
             # Convert to compact numpy arrays
             X_np = None
             y_np = None
@@ -1615,6 +1677,19 @@ def run_enhanced_federated_training(attack_type=None, attacker_clients=[], confi
     server.clients = clients
     server.global_model = None
 
+    asr_by_round = []
+    detected_union = set()
+    backdoor_dir = None
+    run_id = None
+    try:
+        if 'backdoor' in str(config.get('attack_type', '')).lower():
+            from datetime import datetime as _dt
+            run_id = str(config.get('run_id') or f"backdoor_{_dt.now().strftime('%Y%m%d_%H%M%S')}")
+            backdoor_dir = Path('artifacts') / 'backdoor' / run_id
+            backdoor_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        backdoor_dir = None
+
     # Build a fixed probe dataset from clients' validation splits for consistent vectorization
     probe_X = None
     try:
@@ -1856,12 +1931,119 @@ def run_enhanced_federated_training(attack_type=None, attacker_clients=[], confi
                     pass
 
                 entry['is_attacker'] = getattr(c, 'is_attacker', False)
+                try:
+                    atk_norm = str(getattr(c, 'attack_type', '') or '').lower()
+                except Exception:
+                    atk_norm = ''
+                if 'backdoor' in atk_norm:
+                    try:
+                        rounds_cfg = (config or {}).get('attack_rounds')
+                        active = True
+                        if isinstance(rounds_cfg, (list, tuple)):
+                            if len(rounds_cfg) == 2 and all(isinstance(v, (int, float)) for v in rounds_cfg):
+                                lo, hi = int(rounds_cfg[0]), int(rounds_cfg[1])
+                                active = (int(r) >= lo and int(r) <= hi)
+                            else:
+                                active = int(r) in set(int(x) for x in rounds_cfg)
+                    except Exception:
+                        active = True
+                    entry['is_backdoor'] = bool(active and getattr(c, 'is_attacker', False))
+                    try:
+                        entry['poison_ratio'] = float((config or {}).get('poison_ratio', (config or {}).get('poison_fraction', 0.0)) or 0.0)
+                    except Exception:
+                        entry['poison_ratio'] = 0.0
+                    try:
+                        entry['trigger_strength'] = float((config or {}).get('trigger_strength', 0.0) or 0.0)
+                    except Exception:
+                        entry['trigger_strength'] = 0.0
+                    try:
+                        entry['trigger_features'] = (config or {}).get('trigger_features') or {}
+                    except Exception:
+                        pass
                 round_logs.append(entry)
                 try:
                     round_entries.append(dict(entry))
                 except Exception:
                     pass
 
+            try:
+                atk_type_norm2 = str(config.get('attack_type', '')).lower()
+            except Exception:
+                atk_type_norm2 = ''
+            if ('backdoor' in atk_type_norm2) and backdoor_dir is not None:
+                try:
+                    thr_used = 0.5
+                    try:
+                        base_fp = Path('baselines') / 'latest_clean.json'
+                        if base_fp.exists():
+                            with open(base_fp, 'r') as _f:
+                                _base = json.load(_f)
+                            _thr = (_base.get('eval') or {}).get('global_test', {}).get('threshold_used')
+                            if _thr is not None:
+                                thr_used = float(_thr)
+                    except Exception:
+                        pass
+                    gm = {'accuracy': 0.0, 'precision': 0.0, 'recall': 0.0, 'f1': 0.0, 'auc': 0.0}
+                    asr_pct = None
+                    if (X_test is not None) and (X_test_triggered is not None) and (y_test is not None) and getattr(server, 'global_model', None) is not None:
+                        try:
+                            yp_clean = server.global_model.predict(X_test, num_iteration=server.global_model.best_iteration)
+                        except Exception:
+                            yp_clean = server.global_model.predict(X_test)
+                        yb_clean = (np.asarray(yp_clean) >= float(thr_used)).astype(int)
+                        try:
+                            aucv = float(roc_auc_score(y_test, yp_clean))
+                        except Exception:
+                            aucv = 0.0
+                        try:
+                            accv = float(balanced_accuracy_score(y_test, yb_clean))
+                        except Exception:
+                            accv = float('nan')
+                        gm['accuracy'] = accv
+                        gm['precision'] = float(precision_score(y_test, yb_clean, zero_division=0))
+                        gm['recall'] = float(recall_score(y_test, yb_clean, zero_division=0))
+                        gm['f1'] = float(f1_score(y_test, yb_clean, zero_division=0))
+                        gm['auc'] = aucv
+                        try:
+                            yp_trig = server.global_model.predict(X_test_triggered, num_iteration=server.global_model.best_iteration)
+                        except Exception:
+                            yp_trig = server.global_model.predict(X_test_triggered)
+                        yb_trig = (np.asarray(yp_trig) >= float(thr_used)).astype(int)
+                        asr_pct = float(compute_attack_success_rate(y_test, yb_trig, target_label_bd))
+                    asr_by_round.append({'round': int(r), 'asr_percent': asr_pct if asr_pct is not None else 0.0})
+                    det = run_detection_pipeline(round_logs=round_entries)
+                    flagged = []
+                    try:
+                        rep = det.get('metrics', {}).get('enhanced_report', {})
+                        for item in rep.get('high_risk_clients', []) or []:
+                            cid = str(item.get('client_id'))
+                            flagged.append(cid)
+                            detected_union.add(cid)
+                    except Exception:
+                        pass
+                    out = {
+                        'round': int(r),
+                        'threshold': float(thr_used),
+                        'global_metrics': gm,
+                        'asr_percent': asr_pct if asr_pct is not None else 0.0,
+                        'flagged_clients': flagged,
+                        'clients': round_entries
+                    }
+                    fp1 = backdoor_dir / f"round_{r}_summary.json"
+                    with open(fp1, 'w') as f:
+                        json.dump(out, f, indent=2)
+                    det_path = backdoor_dir / f"detection_round_{r}.json"
+                    try:
+                        with open(det_path, 'w') as f:
+                            json.dump(det, f, indent=2, default=lambda x: x.tolist() if hasattr(x, 'tolist') else x)
+                    except Exception:
+                        pass
+                    try:
+                        print(f"[BACKDOOR] Round {r}: ASR={asr_pct if asr_pct is not None else 0.0:.2f}% | flagged={flagged} -> {fp1}")
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
             # Probe-based per-round scaling signature JSON (scaling-only)
             try:
                 atk_type_norm2 = str(config.get('attack_type', '')).lower()

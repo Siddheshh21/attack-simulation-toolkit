@@ -60,7 +60,10 @@ def build_feature_frame_from_logs(round_logs):
         'update_kurtosis', 'update_skewness', 'gradient_entropy',
         
         # New attack-specific features
-        'label_flip_indicator', 'backdoor_pattern_score', 'sybil_similarity_score'
+        'label_flip_indicator', 'backdoor_pattern_score', 'sybil_similarity_score',
+        'client_triggered_asr', 'param_trigger_change', 'poison_ratio', 'trigger_strength',
+        'is_backdoor', 'target_label', 'unusual_label_shift', 'trigger_presence_score',
+        'backdoor_trigger_rate'
     ]
 
     # Create features df with zeros for missing columns
@@ -87,6 +90,51 @@ def build_feature_frame_from_logs(round_logs):
         # Calculate contribution consistency
         client_updates = df.groupby('client').size()
         X_df['contribution_rate'] = df['client'].map(client_updates) / len(df)
+
+    if 'trigger_rate' in df.columns:
+        try:
+            X_df['backdoor_trigger_rate'] = pd.to_numeric(df['trigger_rate'], errors='coerce').fillna(0.0)
+        except Exception:
+            X_df['backdoor_trigger_rate'] = 0.0
+        try:
+            X_df['trigger_presence_score'] = (X_df['backdoor_trigger_rate'] > 0).astype(float)
+        except Exception:
+            X_df['trigger_presence_score'] = 0.0
+    else:
+        X_df['backdoor_trigger_rate'] = 0.0
+        X_df['trigger_presence_score'] = 0.0
+
+    if 'fraud_ratio_change' in df.columns:
+        try:
+            fr_abs = pd.to_numeric(df['fraud_ratio_change'], errors='coerce').fillna(0.0).abs()
+            base = float(fr_abs.quantile(0.75)) if len(fr_abs) > 0 else 0.0
+            X_df['unusual_label_shift'] = (fr_abs > max(0.0, base)).astype(float)
+        except Exception:
+            X_df['unusual_label_shift'] = 0.0
+    else:
+        X_df['unusual_label_shift'] = 0.0
+
+    if 'client_triggered_asr' in df.columns:
+        try:
+            asr_raw = pd.to_numeric(df['client_triggered_asr'], errors='coerce').fillna(0.0)
+            X_df['client_triggered_asr'] = asr_raw.clip(0.0, 1.0)
+        except Exception:
+            X_df['client_triggered_asr'] = 0.0
+
+    if 'poison_ratio' not in X_df.columns:
+        try:
+            X_df['poison_ratio'] = pd.to_numeric(df.get('poison_ratio', 0.0), errors='coerce').fillna(0.0)
+        except Exception:
+            X_df['poison_ratio'] = 0.0
+
+    try:
+        if 'is_backdoor' not in X_df.columns:
+            if 'attack_type' in df.columns:
+                X_df['is_backdoor'] = df['attack_type'].astype(str).str.contains('backdoor', case=False, na=False).astype(float)
+            else:
+                X_df['is_backdoor'] = 0.0
+    except Exception:
+        X_df['is_backdoor'] = X_df.get('is_backdoor', 0.0)
 
     # Sybil-specific engineered features
     try:
@@ -1002,6 +1050,17 @@ def apply_rules(feature_frame):
         backdoor_flag = (feature_frame['backdoor_pattern_score'] > 0.0) if backdoor_flag is None else (backdoor_flag | (feature_frame['backdoor_pattern_score'] > 0.0))
     if backdoor_flag is not None:
         rule_scores['backdoor_suspected'] = backdoor_flag
+    if 'client_triggered_asr' in feature_frame.columns:
+        try:
+            asr_thr = float(getattr(Cfg, 'asr_threshold_for_alert', 0.33))
+        except Exception:
+            asr_thr = 0.33
+        try:
+            asr_vals = pd.to_numeric(feature_frame['client_triggered_asr'], errors='coerce').fillna(0.0).clip(0.0, 1.0)
+            asr_flag = asr_vals >= asr_thr
+            rule_scores['backdoor_suspected'] = rule_scores.get('backdoor_suspected', False) | asr_flag
+        except Exception:
+            pass
         
     # Scaling: detect explicit factor and update-norm anomalies
     try:
